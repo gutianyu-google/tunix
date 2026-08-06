@@ -30,6 +30,43 @@ from jax import lax
 import jax.numpy as jnp
 import numpy as np
 
+# Compatibility shims for JAX strict sharding assertions
+# _orig_wsc = jax.lax.with_sharding_constraint
+# _orig_top_k = jax.lax.top_k
+
+
+# def _compat_wsc(x, shardings):
+#   try:
+#     return _orig_wsc(x, shardings)
+#   except Exception:  # pylint: disable=broad-exception-caught
+#     return jax.sharding.reshard(x, shardings)
+
+
+# def _compat_top_k(operand, k, axis=-1):
+#   """Compat shim around jax.lax.top_k to reshard sharded reduction operands."""
+#   try:
+#     return _orig_top_k(operand, k, axis=axis)
+#   except Exception:  # pylint: disable=broad-exception-caught
+#     sharding = getattr(operand, "sharding", None)
+#     if sharding is not None and hasattr(sharding, "spec") and hasattr(sharding, "mesh"):
+#       spec = list(sharding.spec)
+#       idx = axis if axis >= 0 else len(spec) + axis
+#       if 0 <= idx < len(spec) and spec[idx] is not None:
+#         spec[idx] = None
+#         target_sharding = jax.sharding.NamedSharding(
+#             sharding.mesh, jax.sharding.PartitionSpec(*spec)
+#         )
+#         try:
+#           operand = _orig_wsc(operand, target_sharding)
+#         except Exception:  # pylint: disable=broad-exception-caught
+#           operand = jax.sharding.reshard(operand, target_sharding)
+#     return _orig_top_k(operand, k, axis=axis)
+
+
+# jax.lax.with_sharding_constraint = _compat_wsc
+# # pyrefly: ignore[bad-assignment]
+# jax.lax.top_k = _compat_top_k
+
 
 def compute_attention_masks(
     time_step: int, seq_len: int, input_mask: jax.Array
