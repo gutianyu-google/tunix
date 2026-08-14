@@ -477,6 +477,27 @@ class TrainerPayload:
     segment_ids: Optional [B, T] packing segment ids.
     segment_positions: Optional [B, T] position indices within each segment.
   """
+  # TODO(tunix-dev): We need to remove the dependency on token_ids and
+  # token_mask as they are not used in RL training.
+  token_ids: ArrayLike | None = None
+  token_mask: ArrayLike | None = None
+  segment_ids: ArrayLike | None = None
+  segment_positions: ArrayLike | None = None
+
+
+@dataclasses.dataclass(kw_only=True)
+class SFTTrainerPayload(TrainerPayload):
+  """Generic trainer payload.
+
+  Attributes:
+    token_ids: [B, T] token IDs for a batched trainer payload. By default,
+      each row is structured as left-padded prompt tokens concatenated with
+      right-padded completion tokens.
+    token_mask: [B, T] token mask to differentiate padding tokens from valid
+      tokens.
+    segment_ids: Optional [B, T] packing segment ids.
+    segment_positions: Optional [B, T] position indices within each segment.
+  """
 
   token_ids: ArrayLike
   token_mask: ArrayLike
