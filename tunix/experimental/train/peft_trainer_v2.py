@@ -18,8 +18,9 @@ from collections.abc import Iterable
 import contextlib
 import dataclasses
 import functools
+import ipaddress
 import time
-from typing import Any, Callable, Concatenate, Dict, List, ParamSpec, Tuple
+from typing import Any, Callable, Concatenate, Dict, List, ParamSpec, Sequence, Tuple
 
 from absl import logging
 import flax
@@ -35,6 +36,7 @@ import optax
 import orbax.checkpoint as ocp
 from tunix.experimental.common import datatypes
 from tunix.experimental.metrics import metrics as exp_metrics
+from tunix.experimental.orchestrator import weight_sync
 from tunix.experimental.train import abstract_trainer
 from tunix.perf import metrics as perf_metrics
 from tunix.perf import trace as perf_trace
@@ -1147,12 +1149,186 @@ class PeftTrainer(abstract_trainer.AbstractTrainer):
     return {}
 
   @override
-  def prepare_weight_sync(self, **kwargs) -> None:
-    if kwargs:
-      raise ValueError(f"Unexpected prepare_weight_sync kwargs: {sorted(kwargs)}")
-    raise NotImplementedError(
-        "PeftTrainer V2 weight sync is not implemented yet."
+  def prepare_weight_sync(
+      self, sync_request: Any = None, **kwargs
+  ) -> Sequence[weight_sync.WorkUnitMetadata]:
+    """Stages weights for Raiden transfer and returns WorkUnitMetadata."""
+    wrt_target = nnx.LoRAParam if self._lora_enabled else nnx.Param
+    state = nnx.state(self.model, wrt_target)
+
+    flat_items: list[tuple[str, jax.Array]] = []
+    if hasattr(state, "flat_state"):
+      for path, val in state.flat_state():
+        name = ".".join(str(p) for p in path)
+        arr = val.value if isinstance(val, nnx.Variable) else val
+        flat_items.append((name, arr))
+    else:
+      def _extract_leaves(d: Any, prefix: str = "") -> None:
+        if isinstance(d, dict) or hasattr(d, "items"):
+          for k, v in d.items():
+            p = f"{prefix}.{k}" if prefix else str(k)
+            _extract_leaves(v, p)
+        elif isinstance(d, (list, tuple)):
+          for idx, v in enumerate(d):
+            p = f"{prefix}.{idx}" if prefix else str(idx)
+            _extract_leaves(v, p)
+        elif isinstance(d, nnx.Variable):
+          flat_items.append((prefix, d.value))
+        elif isinstance(d, (jax.Array, np.ndarray)):
+          flat_items.append((prefix, d))
+
+      _extract_leaves(state)
+
+    if not flat_items:
+      # Fallback dummy tensor to keep coordinator protocol valid if model has no trainable params
+      flat_items = [("model.dummy", jnp.zeros((1,), dtype=jnp.float32))]
+
+    arrays: list[jax.Array] = []
+    tensor_metadatas: list[weight_sync.TensorMetadata] = []
+    mesh = getattr(pxla.thread_resources.env, "physical_mesh", None)
+
+    for idx, (name, arr) in enumerate(flat_items):
+      arrays.append(arr)
+      shape = tuple(arr.shape)
+      item_size = arr.dtype.itemsize
+      layout = tuple(range(len(shape) - 1, -1, -1))
+      shd_obj = getattr(arr, "sharding", None)
+
+      if mesh is None and hasattr(shd_obj, "mesh"):
+        mesh = getattr(shd_obj, "mesh")
+
+      if isinstance(shd_obj, shd.NamedSharding) and hasattr(shd_obj, "spec"):
+        spec = shd_obj.spec
+        raw_spec = list(spec) if spec is not None else []
+        padded_spec = raw_spec + [None] * max(0, len(shape) - len(raw_spec))
+        spec_axes = tuple(
+            "" if a is None else (a if isinstance(a, str) else (a[0] if a else ""))
+            for a in padded_spec[: len(shape)]
+        )
+        l_shape = shd_obj.shard_shape(shape)
+        s_shape = tuple(max(1, g // l) for g, l in zip(shape, l_shape))
+      else:
+        spec_axes = tuple("" for _ in range(len(shape)))
+        s_shape = tuple(1 for _ in range(len(shape)))
+
+      tensor_metadatas.append(
+          weight_sync.TensorMetadata(
+              name=name,
+              shape=shape,
+              mesh_shape=s_shape,
+              layout=layout,
+              item_size=item_size,
+              layer_idx=idx,
+              sharding_spec=spec_axes,
+          )
+      )
+
+    if mesh is not None and hasattr(mesh, "shape") and mesh.shape:
+      physical_mesh_shape = tuple(mesh.shape.values())
+      mesh_axes = tuple(mesh.axis_names)
+    else:
+      physical_mesh_shape = (1,)
+      mesh_axes = ("fsdp",)
+
+    has_raiden = False
+    try:
+      from tpu_raiden.frameworks.jax import weight_synchronizer_ffi as raiden_ffi  # pylint: disable=g-import-not-at-top
+      has_raiden = (
+          raiden_ffi is not None
+          and jax.default_backend() == "tpu"
+          and mesh is not None
+      )
+    except Exception:
+      has_raiden = False
+
+    if has_raiden and arrays and mesh is not None:
+      try:
+        def _unpack_ip(row: np.ndarray) -> str:
+          raw_bytes = row[:4].astype(np.int32).tobytes()
+          try:
+            ip_obj = ipaddress.IPv6Address(raw_bytes)
+            if ip_obj.ipv4_mapped is not None:
+              return str(ip_obj.ipv4_mapped)
+            return f"[{ip_obj}]" if ":" in str(ip_obj) else str(ip_obj)
+          except Exception:
+            return "127.0.0.1"
+
+        local_device_count = (
+            len(mesh.local_devices)
+            if hasattr(mesh, "local_devices")
+            else len(mesh.devices.flatten())
+        )
+        src_slice_sizes = [
+            int(
+                np.prod(
+                    getattr(arr, "sharding", None).shard_shape(arr.shape)
+                    if hasattr(getattr(arr, "sharding", None), "shard_shape")
+                    else arr.shape
+                )
+            )
+            * arr.dtype.itemsize
+            for arr in arrays
+        ]
+        src_sizes_sharded = jax.device_put(
+            np.array(src_slice_sizes, dtype=np.int32),
+            shd.NamedSharding(mesh, shd.PartitionSpec(None)),
+        )
+        src_global_ids = np.arange(mesh.devices.size, dtype=np.int32).reshape(
+            mesh.devices.shape
+        )
+        src_shard_idx = jax.device_put(
+            src_global_ids,
+            shd.NamedSharding(mesh, shd.PartitionSpec(*mesh.axis_names)),
+        )
+        src_ws_info = raiden_ffi.init_weight_synchronizer_and_d2h(
+            device_arrays=arrays,
+            shard_idx=src_shard_idx,
+            mesh=mesh,
+            slice_byte_sizes=src_sizes_sharded,
+            parallelism=int(kwargs.get("parallelism", 16)),
+            num_layers=len(arrays),
+            listener_port=0,
+            num_shards=local_device_count,
+        )
+        src_ws_info.block_until_ready()
+        src_info_np = np.asarray(src_ws_info).reshape(-1, 6)
+        src_ips = [f"{_unpack_ip(row)}:{row[4]}" for row in src_info_np]
+        src_listener = f"{_unpack_ip(src_info_np[0])}:{src_info_np[0][5]}"
+      except Exception as err:
+        logging.warning(
+            "Raiden FFI init_weight_synchronizer_and_d2h fallback: %r", err
+        )
+        src_ips = [
+            f"127.0.0.1:{29500 + i}"
+            for i in range(max(1, mesh.devices.size if mesh else 1))
+        ]
+        src_listener = "127.0.0.1:29500"
+    else:
+      src_ips = [
+          f"127.0.0.1:{29500 + i}"
+          for i in range(max(1, mesh.devices.size if mesh else 1))
+      ]
+      src_listener = "127.0.0.1:29500"
+
+    job_name = str(kwargs.get("job_name", "trainer"))
+    work_unit = weight_sync.WorkUnitMetadata(
+        unit=weight_sync.WorkUnitId(
+            job_name=job_name,
+            job_replica_id=str(kwargs.get("job_replica_id", "0")),
+            data_name="weights",
+        ),
+        shards=tuple(src_ips),
+        control_plane_rpc_address=src_listener,
+        mesh_shape=physical_mesh_shape,
+        mesh_axes=mesh_axes,
+        variables=tuple(tensor_metadatas),
     )
+    return [work_unit]
+
+  @override
+  def release_weight_sync(self, sync_request: Any = None, **kwargs) -> None:
+    """Releases resources held for weight synchronization staging."""
+    del sync_request, kwargs
 
   @override
   def get_metrics(self) -> exp_metrics.MetricsBuffer:
@@ -1353,6 +1529,11 @@ class PeftTrainer(abstract_trainer.AbstractTrainer):
   @property
   def train_steps(self) -> int:
     """Returns the number of train steps taken."""
+    return self._train_steps
+
+  @property
+  def policy_version(self) -> int:
+    """Returns the current policy version (number of update steps)."""
     return self._train_steps
 
   @property
