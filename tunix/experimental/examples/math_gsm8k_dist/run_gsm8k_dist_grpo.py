@@ -119,6 +119,12 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
       default="synthetic",
       help="synthetic proves the distributed chain without relying on quality.",
   )
+  parser.add_argument(
+      "--sync_weights",
+      action=argparse.BooleanOptionalAction,
+      default=True,
+      help="Whether to synchronize weights between trainer and rollouts.",
+  )
   parser.add_argument("--rpc_timeout_s", type=float, default=1800.0)
   parser.add_argument("--stop_workers_on_exit", action="store_true")
   return parser.parse_args(argv)
@@ -429,7 +435,7 @@ def main(argv: list[str], context: Any = None) -> None:
           max_response_length=args.max_response_length,
           pad_id=pad_id,
       ),
-      sync_weights=False,
+      sync_weights=args.sync_weights,
       on_step_begin=lambda step: logging.info("GRPO step %d starting.", step),
       on_step_end=lambda step, result: logging.info(
           "GRPO advanced to policy_version=%d train_result=%s.", step, result
