@@ -15,10 +15,18 @@
 """Legacy vLLM Sampler adapter integrating with Tunix VllmSampler."""
 
 import abc
+import asyncio
+import ipaddress
 import numbers
-from typing import Any, List, Sequence
+from typing import Any, List, Mapping, Sequence
+from absl import logging
+import jax
+import jax.numpy as jnp
+import jax.sharding as shd
 import numpy as np
 
+from tunix.experimental.orchestrator import weight_sync
+from tunix.experimental.orchestrator import weight_sync_coordinator
 from tunix.experimental.rollout import sampler as base_sampler_lib
 
 Sampler = base_sampler_lib.Sampler
@@ -46,6 +54,14 @@ class LegacyVllmSamplerAdapter(Sampler, abc.ABC):
     self.config = config
     self.model_name = model_name or kwargs.get("model", "")
     self.vllm_sampler = None
+    self._tracker = weight_sync_coordinator.WorkerRoundTracker()
+    self._phase_lock = asyncio.Lock()
+    self._admitting = asyncio.Event()
+    self._admitting.set()
+    self._pending_weights: Any = None
+    self._dst_ws_info: Any = None
+    self._dst_staging_arrays: list[jax.Array] = []
+    self._dst_variable_names: list[str] = []
 
     if self.tokenizer is not None and self.config is not None:
       vllm_lib = _get_vllm_sampler_cls()
@@ -134,11 +150,13 @@ class LegacyVllmSamplerAdapter(Sampler, abc.ABC):
   async def pause(self, **kwargs) -> str | None | Any:
     """Pauses inference processing on this worker slice."""
     del kwargs
+    self._admitting.clear()
     return True
 
   async def resume(self, **kwargs) -> str | None | Any:
     """Resumes inference processing on this worker slice."""
     del kwargs
+    self._admitting.set()
     return True
 
   async def get_mesh(self, **kwargs) -> Any:
@@ -163,6 +181,7 @@ class LegacyVllmSamplerAdapter(Sampler, abc.ABC):
       | Any
   ):
     """Generates completions using underlying Tunix VllmSampler."""
+    await self._admitting.wait()
     if not self.vllm_sampler:
       raise RuntimeError(
           f"LegacyVllmSamplerAdapter [{self.server_id}] vllm_sampler is not"
@@ -271,30 +290,265 @@ class LegacyVllmSamplerAdapter(Sampler, abc.ABC):
       return responses
     return responses[0]
 
-  # --- Weight Synchronization ---
-  async def get_weight_sync_metadata(self, **kwargs) -> Any:
-    """Returns sharding specs and layout metadata across devices for weights."""
+  # --- Weight Synchronization (WeightSyncDestination) ---
+  async def bind_weight_sync(self) -> None:
+    """Binds destination-side transport resources."""
+    if self.vllm_sampler is None:
+      self.initialize()
+
+    mesh = await self.get_mesh()
+    has_raiden = False
+    try:
+      from tpu_raiden.frameworks.jax import weight_synchronizer_ffi as raiden_ffi  # pylint: disable=g-import-not-at-top
+      has_raiden = (
+          raiden_ffi is not None
+          and jax.default_backend() == "tpu"
+          and mesh is not None
+      )
+    except Exception:
+      has_raiden = False
+
+    if has_raiden and mesh is not None and not self._dst_ws_info:
+      try:
+        arrays: list[jax.Array] = []
+        names: list[str] = []
+        # Extract existing weights to allocate matching staging double-buffers
+        if hasattr(self.vllm_sampler, "transformer_state") and self.vllm_sampler.transformer_state:
+          def _extract(d: Any, p: str = "") -> None:
+            if isinstance(d, dict) or hasattr(d, "items"):
+              for k, v in d.items():
+                _extract(v, f"{p}.{k}" if p else str(k))
+            elif isinstance(d, (jax.Array, np.ndarray)):
+              names.append(p)
+              arrays.append(d)
+          _extract(self.vllm_sampler.transformer_state)
+
+        if not arrays:
+          dummy_arr = jax.device_put(
+              np.zeros((1024, 1024), dtype=np.float32),
+              shd.NamedSharding(mesh, shd.PartitionSpec(None)),
+          )
+          arrays = [dummy_arr]
+          names = ["model.dummy"]
+
+        # Allocate separate isolated staging double-buffers
+        self._dst_staging_arrays = [jnp.zeros_like(arr) for arr in arrays]
+        self._dst_variable_names = names
+
+        local_device_count = (
+            len(mesh.local_devices)
+            if hasattr(mesh, "local_devices")
+            else len(mesh.devices.flatten())
+        )
+        dst_slice_sizes = [
+            int(
+                np.prod(
+                    getattr(arr, "sharding", None).shard_shape(arr.shape)
+                    if hasattr(getattr(arr, "sharding", None), "shard_shape")
+                    else arr.shape
+                )
+            )
+            * arr.dtype.itemsize
+            for arr in self._dst_staging_arrays
+        ]
+        dst_sizes_sharded = jax.device_put(
+            np.array(dst_slice_sizes, dtype=np.int32),
+            shd.NamedSharding(mesh, shd.PartitionSpec(None)),
+        )
+        dst_global_ids = np.arange(mesh.devices.size, dtype=np.int32).reshape(
+            mesh.devices.shape
+        )
+        dst_shard_idx = jax.device_put(
+            dst_global_ids,
+            shd.NamedSharding(mesh, shd.PartitionSpec(*mesh.axis_names)),
+        )
+        self._dst_ws_info = raiden_ffi.init_weight_synchronizer(
+            device_array=self._dst_staging_arrays[0],
+            shard_idx=dst_shard_idx,
+            mesh=mesh,
+            slice_byte_sizes=dst_sizes_sharded,
+            parallelism=16,
+            num_layers=len(self._dst_staging_arrays),
+            listener_port=0,
+            num_shards=local_device_count,
+        )
+        self._dst_ws_info.block_until_ready()
+      except Exception as err:
+        logging.warning("Raiden destination binding fallback: %r", err)
+
+  async def get_weight_sync_metadata(
+      self, **kwargs
+  ) -> Sequence[weight_sync.WorkUnitMetadata]:
+    """Returns transport metadata for this worker."""
     del kwargs
-    raise NotImplementedError(
-        "get_weight_sync_metadata() not implemented for this SamplerServer."
+    if self.vllm_sampler is None:
+      self.initialize()
+
+    mesh = await self.get_mesh()
+    if mesh is not None and hasattr(mesh, "shape") and mesh.shape:
+      physical_mesh_shape = tuple(mesh.shape.values())
+      mesh_axes = tuple(mesh.axis_names)
+    else:
+      physical_mesh_shape = (1,)
+      mesh_axes = ("tp",)
+
+    if self._dst_ws_info is not None:
+      def _unpack_ip(row: np.ndarray) -> str:
+        raw_bytes = row[:4].astype(np.int32).tobytes()
+        try:
+          ip_obj = ipaddress.IPv6Address(raw_bytes)
+          if ip_obj.ipv4_mapped is not None:
+            return str(ip_obj.ipv4_mapped)
+          return f"[{ip_obj}]" if ":" in str(ip_obj) else str(ip_obj)
+        except Exception:
+          return "127.0.0.1"
+
+      dst_info_np = np.asarray(self._dst_ws_info).reshape(-1, 6)
+      dst_ips = [f"{_unpack_ip(row)}:{row[4]}" for row in dst_info_np]
+      dst_listener = f"{_unpack_ip(dst_info_np[0])}:{dst_info_np[0][5]}"
+    else:
+      dst_ips = [
+          f"127.0.0.1:{29600 + i}"
+          for i in range(max(1, mesh.devices.size if mesh else 1))
+      ]
+      dst_listener = "127.0.0.1:29600"
+
+    variables: list[weight_sync.TensorMetadata] = []
+    if self._dst_staging_arrays:
+      for idx, arr in enumerate(self._dst_staging_arrays):
+        shape = tuple(arr.shape)
+        shd_obj = getattr(arr, "sharding", None)
+        if isinstance(shd_obj, shd.NamedSharding) and hasattr(shd_obj, "spec"):
+          spec = shd_obj.spec
+          raw_spec = list(spec) if spec is not None else []
+          padded_spec = raw_spec + [None] * max(0, len(shape) - len(raw_spec))
+          spec_axes = tuple(
+              "" if a is None else (a if isinstance(a, str) else (a[0] if a else ""))
+              for a in padded_spec[: len(shape)]
+          )
+          l_shape = shd_obj.shard_shape(shape)
+          s_shape = tuple(max(1, g // l) for g, l in zip(shape, l_shape))
+        else:
+          spec_axes = tuple("" for _ in range(len(shape)))
+          s_shape = tuple(1 for _ in range(len(shape)))
+
+        var_name = (
+            self._dst_variable_names[idx]
+            if idx < len(self._dst_variable_names)
+            else f"param_{idx}"
+        )
+        variables.append(
+            weight_sync.TensorMetadata(
+                name=var_name,
+                shape=shape,
+                mesh_shape=s_shape,
+                layout=tuple(range(len(shape) - 1, -1, -1)),
+                item_size=arr.dtype.itemsize,
+                layer_idx=idx,
+                sharding_spec=spec_axes,
+            )
+        )
+
+    work_unit = weight_sync.WorkUnitMetadata(
+        unit=weight_sync.WorkUnitId(
+            job_name=self.server_id,
+            job_replica_id="0",
+            data_name="weights",
+        ),
+        shards=tuple(dst_ips),
+        control_plane_rpc_address=dst_listener,
+        mesh_shape=physical_mesh_shape,
+        mesh_axes=mesh_axes,
+        variables=tuple(variables),
     )
+    return [work_unit]
 
   async def pre_weight_sync(self, sync_request: Any = None, **kwargs) -> Any:
     """Prepares staging handshake prior to policy weight update."""
-    del sync_request, kwargs
+    del kwargs
+    async with self._phase_lock:
+      if self._tracker.admit(sync_request, "prepared"):
+        await self.pause()
+        if self.vllm_sampler is not None:
+          if hasattr(self.vllm_sampler, "llm") and self.vllm_sampler.llm is not None:
+            try:
+              self.vllm_sampler.llm.reset_prefix_cache()
+              self.vllm_sampler.llm.collective_rpc("delete_kv_cache")
+            except Exception:
+              pass
+          elif hasattr(self.vllm_sampler, "clear_cache"):
+            self.vllm_sampler.clear_cache()
+        self._tracker.complete(sync_request, "prepared")
     return True
 
   async def weight_sync(self, sync_request: Any = None, **kwargs) -> Any:
     """Updates model weights in-place from the specified controller."""
     del kwargs
-    if (
-        sync_request is not None
-        and self.vllm_sampler
-        and hasattr(self.vllm_sampler, "update_params")
-    ):
-      weights = getattr(sync_request, "weights", sync_request)
-      self.vllm_sampler.update_params(weights)
+    async with self._phase_lock:
+      if self._tracker.admit(sync_request, "h2d_done"):
+        has_raiden = False
+        try:
+          from tpu_raiden.frameworks.jax import weight_synchronizer_ffi as raiden_ffi  # pylint: disable=g-import-not-at-top
+          mesh = await self.get_mesh()
+          has_raiden = (
+              raiden_ffi is not None
+              and jax.default_backend() == "tpu"
+              and mesh is not None
+              and bool(self._dst_staging_arrays)
+          )
+        except Exception:
+          has_raiden = False
+
+        if has_raiden and mesh is not None:
+          dst_global_ids = np.arange(mesh.devices.size, dtype=np.int32).reshape(
+              mesh.devices.shape
+          )
+          dst_shard_idx = jax.device_put(
+              dst_global_ids,
+              shd.NamedSharding(mesh, shd.PartitionSpec(*mesh.axis_names)),
+          )
+          dst_updated = raiden_ffi.multi_h2d(
+              self._dst_staging_arrays, dst_shard_idx, mesh
+          )
+          for arr in dst_updated:
+            arr.block_until_ready()
+          self._pending_weights = dst_updated
+        elif sync_request is not None:
+          weights = getattr(sync_request, "weights", None)
+          if weights is not None:
+            self._pending_weights = weights
+        self._tracker.complete(sync_request, "h2d_done")
     return True
+
+  async def post_weight_sync(self, sync_request: Any = None, **kwargs) -> Any:
+    """Finalizes and switches active policy weights after transfer completion."""
+    del kwargs
+    async with self._phase_lock:
+      if self._tracker.admit(sync_request, "committed"):
+        if (
+            self._pending_weights is not None
+            and self.vllm_sampler
+            and hasattr(self.vllm_sampler, "update_params")
+        ):
+          self.vllm_sampler.update_params(self._pending_weights)
+          self._pending_weights = None
+        await self.resume()
+        self._tracker.complete(sync_request, "committed")
+    return True
+
+  async def abort_weight_sync(self, sync_request: Any = None, **kwargs) -> Any:
+    """Rolls back to serving the previous weights."""
+    del kwargs
+    async with self._phase_lock:
+      if self._tracker.admit(sync_request, "aborted"):
+        self._pending_weights = None
+        await self.resume()
+        self._tracker.complete(sync_request, "aborted")
+    return True
+
+  async def get_weight_sync_status(self) -> Mapping[str, Any]:
+    """Returns the worker round tracker status report."""
+    return self._tracker.report()
 
   async def get_transfer_status(self, req_id: Any, **kwargs) -> Any:
     """Queries status of an ongoing weight transfer or KV-cache migration."""
@@ -305,11 +559,6 @@ class LegacyVllmSamplerAdapter(Sampler, abc.ABC):
     """Returns best-effort vLLM queue/cache load information."""
     del kwargs
     return base_sampler_lib.LoadInfo()
-
-  async def post_weight_sync(self, sync_request: Any = None, **kwargs) -> Any:
-    """Finalizes and switches active policy weights after transfer completion."""
-    del sync_request, kwargs
-    return True
 
   async def migrate_kv_cache(
       self,
