@@ -14,10 +14,16 @@
 
 """Legacy vLLM Sampler adapter integrating with Tunix VllmSampler."""
 
+try:
+  import tpu_raiden.frameworks.jax._tpu_raiden_jax  # Preload raiden C++ module before JAX init
+except Exception:
+  pass
+
 import abc
 import asyncio
 import ipaddress
 import numbers
+import re
 from typing import Any, List, Mapping, Sequence
 from absl import logging
 import jax
@@ -38,6 +44,48 @@ def _get_vllm_sampler_cls():
   return generate_vllm_lib
 
 
+def _hf_to_tunix_name(name: str) -> str:
+  """Maps HuggingFace/vLLM parameter names to Tunix model parameter names."""
+  if name == "model.embed_tokens.weight":
+    return "embedder.input_embedding"
+  if name == "model.norm.weight":
+    return "final_norm.w"
+  if name in ("lm_head.weight", "model.lm_head.weight"):
+    return "lm_head.w"
+  m = re.match(r"model\.layers\.(\d+)\.(.*)", name)
+  if m:
+    layer_idx, rest = m.groups()
+    if rest == "input_layernorm.weight":
+      return f"layers.{layer_idx}.input_layernorm.w"
+    if rest == "post_attention_layernorm.weight":
+      return f"layers.{layer_idx}.post_attention_layernorm.w"
+    if rest == "mlp.down_proj.weight":
+      return f"layers.{layer_idx}.mlp.down_proj.kernel"
+    if rest == "mlp.gate_proj.weight":
+      return f"layers.{layer_idx}.mlp.gate_proj.kernel"
+    if rest == "mlp.up_proj.weight":
+      return f"layers.{layer_idx}.mlp.up_proj.kernel"
+    if rest == "self_attn.k_norm.weight":
+      return f"layers.{layer_idx}.attn.k_norm.w"
+    if rest == "self_attn.q_norm.weight":
+      return f"layers.{layer_idx}.attn.q_norm.w"
+    if rest == "self_attn.k_proj.weight":
+      return f"layers.{layer_idx}.attn.k_proj.w"
+    if rest == "self_attn.q_proj.weight":
+      return f"layers.{layer_idx}.attn.q_proj.w"
+    if rest == "self_attn.v_proj.weight":
+      return f"layers.{layer_idx}.attn.v_proj.w"
+    if rest == "self_attn.o_proj.weight":
+      return f"layers.{layer_idx}.attn.o_proj.w"
+    if rest == "self_attn.k_proj.bias":
+      return f"layers.{layer_idx}.attn.k_bias"
+    if rest == "self_attn.q_proj.bias":
+      return f"layers.{layer_idx}.attn.q_bias"
+    if rest == "self_attn.v_proj.bias":
+      return f"layers.{layer_idx}.attn.v_bias"
+  return name
+
+
 class LegacyVllmSamplerAdapter(Sampler, abc.ABC):
   """Sampler adapter wrapping Tunix VllmSampler."""
 
@@ -53,7 +101,7 @@ class LegacyVllmSamplerAdapter(Sampler, abc.ABC):
     self.tokenizer = tokenizer
     self.config = config
     self.model_name = model_name or kwargs.get("model", "")
-    self.vllm_sampler = None
+    self.vllm_sampler = kwargs.get("vllm_sampler", None)
     self._tracker = weight_sync_coordinator.WorkerRoundTracker()
     self._phase_lock = asyncio.Lock()
     self._admitting = asyncio.Event()
@@ -63,7 +111,7 @@ class LegacyVllmSamplerAdapter(Sampler, abc.ABC):
     self._dst_staging_arrays: list[jax.Array] = []
     self._dst_variable_names: list[str] = []
 
-    if self.tokenizer is not None and self.config is not None:
+    if self.vllm_sampler is None and self.tokenizer is not None and self.config is not None:
       vllm_lib = _get_vllm_sampler_cls()
       self.vllm_sampler = vllm_lib.VllmSampler(
           tokenizer=self.tokenizer, config=self.config
@@ -71,6 +119,8 @@ class LegacyVllmSamplerAdapter(Sampler, abc.ABC):
 
   def initialize(self) -> None:
     """Initializes vLLM sampler if needed."""
+    if self.vllm_sampler is not None:
+      return
     if self.tokenizer is None and self.model_name:
       from transformers import AutoTokenizer  # pylint: disable=g-import-not-at-top
       from tunix.generate import vllm_sampler as tunix_vllm_sampler  # pylint: disable=g-import-not-at-top
@@ -299,82 +349,61 @@ class LegacyVllmSamplerAdapter(Sampler, abc.ABC):
     mesh = await self.get_mesh()
     has_raiden = False
     try:
-      from tpu_raiden.frameworks.jax import weight_synchronizer_ffi as raiden_ffi  # pylint: disable=g-import-not-at-top
+      from tpu_raiden.api.jax.weight_synchronizer import WeightSynchronizer  # pylint: disable=g-import-not-at-top
       has_raiden = (
-          raiden_ffi is not None
+          WeightSynchronizer is not None
           and jax.default_backend() == "tpu"
           and mesh is not None
       )
     except Exception:
       has_raiden = False
 
-    if has_raiden and mesh is not None and not self._dst_ws_info:
+    if has_raiden and mesh is not None and not getattr(self, "_dst_ws", None):
       try:
         arrays: list[jax.Array] = []
         names: list[str] = []
-        # Extract existing weights to allocate matching staging double-buffers
-        if hasattr(self.vllm_sampler, "transformer_state") and self.vllm_sampler.transformer_state:
-          def _extract(d: Any, p: str = "") -> None:
-            if isinstance(d, dict) or hasattr(d, "items"):
-              for k, v in d.items():
-                _extract(v, f"{p}.{k}" if p else str(k))
-            elif isinstance(d, (jax.Array, np.ndarray)):
-              names.append(p)
-              arrays.append(d)
-          _extract(self.vllm_sampler.transformer_state)
+        if hasattr(self.vllm_sampler, "transformer_state") and self.vllm_sampler.transformer_state is not None:
+          dst_state = self.vllm_sampler.transformer_state
+          dst_dict = {}
+          if hasattr(dst_state, "flat_state"):
+            for path, val in dst_state.flat_state():
+              arr = val.get_value() if hasattr(val, "get_value") else getattr(val, "value", val)
+              if isinstance(arr, (jax.Array, np.ndarray)):
+                hf_name = ".".join(str(p) for p in path)
+                tunix_name = _hf_to_tunix_name(hf_name)
+                dst_dict[tunix_name] = arr
+            sorted_keys = sorted(dst_dict.keys())
+            names = sorted_keys
+            arrays = [dst_dict[k] for k in sorted_keys]
+          else:
+            for i, x in enumerate(jax.tree_util.tree_leaves(dst_state)):
+              if isinstance(x, (jax.Array, np.ndarray)):
+                names.append(f"param_{i}")
+                arrays.append(x)
 
         if not arrays:
+          axis0 = mesh.axis_names[0] if mesh.axis_names else "dp"
+          axis1 = mesh.axis_names[1] if len(mesh.axis_names) > 1 else "tp"
           dummy_arr = jax.device_put(
-              np.zeros((1024, 1024), dtype=np.float32),
-              shd.NamedSharding(mesh, shd.PartitionSpec(None)),
+              jnp.zeros((1024, 1024), dtype=jnp.float32),
+              shd.NamedSharding(mesh, shd.PartitionSpec(axis0, axis1)),
           )
           arrays = [dummy_arr]
           names = ["model.dummy"]
 
-        # Allocate separate isolated staging double-buffers
-        self._dst_staging_arrays = [jnp.zeros_like(arr) for arr in arrays]
+        self._dst_staging_arrays = arrays
         self._dst_variable_names = names
 
-        local_device_count = (
-            len(mesh.local_devices)
-            if hasattr(mesh, "local_devices")
-            else len(mesh.devices.flatten())
-        )
-        dst_slice_sizes = [
-            int(
-                np.prod(
-                    getattr(arr, "sharding", None).shard_shape(arr.shape)
-                    if hasattr(getattr(arr, "sharding", None), "shard_shape")
-                    else arr.shape
-                )
-            )
-            * arr.dtype.itemsize
-            for arr in self._dst_staging_arrays
-        ]
-        dst_sizes_sharded = jax.device_put(
-            np.array(dst_slice_sizes, dtype=np.int32),
-            shd.NamedSharding(mesh, shd.PartitionSpec(None)),
-        )
-        dst_global_ids = np.arange(mesh.devices.size, dtype=np.int32).reshape(
-            mesh.devices.shape
-        )
-        dst_shard_idx = jax.device_put(
-            dst_global_ids,
-            shd.NamedSharding(mesh, shd.PartitionSpec(*mesh.axis_names)),
-        )
-        self._dst_ws_info = raiden_ffi.init_weight_synchronizer(
-            device_array=self._dst_staging_arrays[0],
-            shard_idx=dst_shard_idx,
-            mesh=mesh,
-            slice_byte_sizes=dst_sizes_sharded,
+        from tpu_raiden.api.jax.weight_synchronizer import WeightSynchronizer  # pylint: disable=g-import-not-at-top
+        self._dst_ws = WeightSynchronizer(
+            jax_arrays=self._dst_staging_arrays,
             parallelism=16,
-            num_layers=len(self._dst_staging_arrays),
             listener_port=0,
-            num_shards=local_device_count,
+            unsafe_skip_buffer_lock=True,
         )
-        self._dst_ws_info.block_until_ready()
       except Exception as err:
         logging.warning("Raiden destination binding fallback: %r", err)
+        self._dst_ws = None
 
   async def get_weight_sync_metadata(
       self, **kwargs
@@ -385,31 +414,30 @@ class LegacyVllmSamplerAdapter(Sampler, abc.ABC):
       self.initialize()
 
     mesh = await self.get_mesh()
-    if mesh is not None and hasattr(mesh, "shape") and mesh.shape:
-      physical_mesh_shape = tuple(mesh.shape.values())
-      mesh_axes = tuple(mesh.axis_names)
+    if mesh is not None and hasattr(mesh, "shape") and isinstance(mesh.shape, dict) and mesh.shape:
+      if len(mesh.shape) == 1:
+        physical_mesh_shape = (1, tuple(mesh.shape.values())[0])
+        mesh_axes = ("data", tuple(mesh.axis_names)[0])
+      else:
+        physical_mesh_shape = tuple(mesh.shape.values())
+        mesh_axes = tuple(mesh.axis_names)
     else:
-      physical_mesh_shape = (1,)
-      mesh_axes = ("tp",)
+      physical_mesh_shape = (1, 1)
+      mesh_axes = ("data", "tp")
 
-    if self._dst_ws_info is not None:
-      def _unpack_ip(row: np.ndarray) -> str:
-        raw_bytes = row[:4].astype(np.int32).tobytes()
-        try:
-          ip_obj = ipaddress.IPv6Address(raw_bytes)
-          if ip_obj.ipv4_mapped is not None:
-            return str(ip_obj.ipv4_mapped)
-          return f"[{ip_obj}]" if ":" in str(ip_obj) else str(ip_obj)
-        except Exception:
-          return "127.0.0.1"
-
-      dst_info_np = np.asarray(self._dst_ws_info).reshape(-1, 6)
-      dst_ips = [f"{_unpack_ip(row)}:{row[4]}" for row in dst_info_np]
-      dst_listener = f"{_unpack_ip(dst_info_np[0])}:{dst_info_np[0][5]}"
+    if getattr(self, "_dst_ws", None) is not None:
+      dst_ips = [f"127.0.0.1:{self._dst_ws.local_port}"]
+      dst_listener = f"127.0.0.1:{self._dst_ws.listener_port}"
     else:
+      num_devices = 1
+      if mesh is not None and hasattr(mesh, "devices"):
+        devs = getattr(mesh, "devices", None)
+        if hasattr(devs, "size") and isinstance(devs.size, int):
+          num_devices = max(1, devs.size)
+
       dst_ips = [
           f"127.0.0.1:{29600 + i}"
-          for i in range(max(1, mesh.devices.size if mesh else 1))
+          for i in range(num_devices)
       ]
       dst_listener = "127.0.0.1:29600"
 
@@ -469,15 +497,6 @@ class LegacyVllmSamplerAdapter(Sampler, abc.ABC):
     async with self._phase_lock:
       if self._tracker.admit(sync_request, "prepared"):
         await self.pause()
-        if self.vllm_sampler is not None:
-          if hasattr(self.vllm_sampler, "llm") and self.vllm_sampler.llm is not None:
-            try:
-              self.vllm_sampler.llm.reset_prefix_cache()
-              self.vllm_sampler.llm.collective_rpc("delete_kv_cache")
-            except Exception:
-              pass
-          elif hasattr(self.vllm_sampler, "clear_cache"):
-            self.vllm_sampler.clear_cache()
         self._tracker.complete(sync_request, "prepared")
     return True
 
@@ -486,33 +505,9 @@ class LegacyVllmSamplerAdapter(Sampler, abc.ABC):
     del kwargs
     async with self._phase_lock:
       if self._tracker.admit(sync_request, "h2d_done"):
-        has_raiden = False
-        try:
-          from tpu_raiden.frameworks.jax import weight_synchronizer_ffi as raiden_ffi  # pylint: disable=g-import-not-at-top
-          mesh = await self.get_mesh()
-          has_raiden = (
-              raiden_ffi is not None
-              and jax.default_backend() == "tpu"
-              and mesh is not None
-              and bool(self._dst_staging_arrays)
-          )
-        except Exception:
-          has_raiden = False
-
-        if has_raiden and mesh is not None:
-          dst_global_ids = np.arange(mesh.devices.size, dtype=np.int32).reshape(
-              mesh.devices.shape
-          )
-          dst_shard_idx = jax.device_put(
-              dst_global_ids,
-              shd.NamedSharding(mesh, shd.PartitionSpec(*mesh.axis_names)),
-          )
-          dst_updated = raiden_ffi.multi_h2d(
-              self._dst_staging_arrays, dst_shard_idx, mesh
-          )
-          for arr in dst_updated:
-            arr.block_until_ready()
-          self._pending_weights = dst_updated
+        if getattr(self, "_dst_ws", None) is not None:
+          self._dst_ws.h2d()
+          jax.effects_barrier()
         elif sync_request is not None:
           weights = getattr(sync_request, "weights", None)
           if weights is not None:
@@ -525,7 +520,12 @@ class LegacyVllmSamplerAdapter(Sampler, abc.ABC):
     del kwargs
     async with self._phase_lock:
       if self._tracker.admit(sync_request, "committed"):
-        if (
+        if self.vllm_sampler and getattr(self.vllm_sampler, "llm", None) is not None:
+          try:
+            self.vllm_sampler.llm.reset_prefix_cache()
+          except Exception:
+            pass
+        elif (
             self._pending_weights is not None
             and self.vllm_sampler
             and hasattr(self.vllm_sampler, "update_params")

@@ -1179,6 +1179,8 @@ class PeftTrainer(abstract_trainer.AbstractTrainer):
 
       _extract_leaves(state)
 
+    flat_items = sorted(flat_items, key=lambda x: x[0])
+
     if not flat_items:
       # Fallback dummy tensor to keep coordinator protocol valid if model has no trainable params
       flat_items = [("model.dummy", jnp.zeros((1,), dtype=jnp.float32))]
@@ -1224,86 +1226,31 @@ class PeftTrainer(abstract_trainer.AbstractTrainer):
       )
 
     if mesh is not None and hasattr(mesh, "shape") and mesh.shape:
-      physical_mesh_shape = tuple(mesh.shape.values())
-      mesh_axes = tuple(mesh.axis_names)
+      if len(mesh.shape) == 1:
+        physical_mesh_shape = (1, tuple(mesh.shape.values())[0])
+        mesh_axes = ("data", tuple(mesh.axis_names)[0])
+      else:
+        physical_mesh_shape = tuple(mesh.shape.values())
+        mesh_axes = tuple(mesh.axis_names)
     else:
-      physical_mesh_shape = (1,)
-      mesh_axes = ("fsdp",)
+      physical_mesh_shape = (1, 1)
+      mesh_axes = ("data", "fsdp")
 
-    has_raiden = False
     try:
-      from tpu_raiden.frameworks.jax import weight_synchronizer_ffi as raiden_ffi  # pylint: disable=g-import-not-at-top
-      has_raiden = (
-          raiden_ffi is not None
-          and jax.default_backend() == "tpu"
-          and mesh is not None
+      from tpu_raiden.api.jax.weight_synchronizer import WeightSynchronizer  # pylint: disable=g-import-not-at-top
+      self._src_ws = WeightSynchronizer(
+          jax_arrays=arrays,
+          parallelism=int(kwargs.get("parallelism", 16)),
+          listener_port=0,
+          unsafe_skip_buffer_lock=True,
       )
-    except Exception:
-      has_raiden = False
-
-    if has_raiden and arrays and mesh is not None:
-      try:
-        def _unpack_ip(row: np.ndarray) -> str:
-          raw_bytes = row[:4].astype(np.int32).tobytes()
-          try:
-            ip_obj = ipaddress.IPv6Address(raw_bytes)
-            if ip_obj.ipv4_mapped is not None:
-              return str(ip_obj.ipv4_mapped)
-            return f"[{ip_obj}]" if ":" in str(ip_obj) else str(ip_obj)
-          except Exception:
-            return "127.0.0.1"
-
-        local_device_count = (
-            len(mesh.local_devices)
-            if hasattr(mesh, "local_devices")
-            else len(mesh.devices.flatten())
-        )
-        src_slice_sizes = [
-            int(
-                np.prod(
-                    getattr(arr, "sharding", None).shard_shape(arr.shape)
-                    if hasattr(getattr(arr, "sharding", None), "shard_shape")
-                    else arr.shape
-                )
-            )
-            * arr.dtype.itemsize
-            for arr in arrays
-        ]
-        src_sizes_sharded = jax.device_put(
-            np.array(src_slice_sizes, dtype=np.int32),
-            shd.NamedSharding(mesh, shd.PartitionSpec(None)),
-        )
-        src_global_ids = np.arange(mesh.devices.size, dtype=np.int32).reshape(
-            mesh.devices.shape
-        )
-        src_shard_idx = jax.device_put(
-            src_global_ids,
-            shd.NamedSharding(mesh, shd.PartitionSpec(*mesh.axis_names)),
-        )
-        src_ws_info = raiden_ffi.init_weight_synchronizer_and_d2h(
-            device_arrays=arrays,
-            shard_idx=src_shard_idx,
-            mesh=mesh,
-            slice_byte_sizes=src_sizes_sharded,
-            parallelism=int(kwargs.get("parallelism", 16)),
-            num_layers=len(arrays),
-            listener_port=0,
-            num_shards=local_device_count,
-        )
-        src_ws_info.block_until_ready()
-        src_info_np = np.asarray(src_ws_info).reshape(-1, 6)
-        src_ips = [f"{_unpack_ip(row)}:{row[4]}" for row in src_info_np]
-        src_listener = f"{_unpack_ip(src_info_np[0])}:{src_info_np[0][5]}"
-      except Exception as err:
-        logging.warning(
-            "Raiden FFI init_weight_synchronizer_and_d2h fallback: %r", err
-        )
-        src_ips = [
-            f"127.0.0.1:{29500 + i}"
-            for i in range(max(1, mesh.devices.size if mesh else 1))
-        ]
-        src_listener = "127.0.0.1:29500"
-    else:
+      self._src_ws.d2h()
+      src_ips = [f"127.0.0.1:{self._src_ws.local_port}"]
+      src_listener = f"127.0.0.1:{self._src_ws.listener_port}"
+    except Exception as err:
+      logging.warning(
+          "Raiden WeightSynchronizer prepare_weight_sync fallback: %r", err
+      )
       src_ips = [
           f"127.0.0.1:{29500 + i}"
           for i in range(max(1, mesh.devices.size if mesh else 1))
