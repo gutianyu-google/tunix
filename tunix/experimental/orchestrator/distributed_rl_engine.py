@@ -100,26 +100,143 @@ def _response_to_trajectory_item(resp: Any) -> datatypes.TrajectoryItem:
   )
 
 
+class _ActorHandleSourceAdapter(weight_sync.WeightSyncSource):
+  """Adapts an ActorHandle to satisfy WeightSyncSource protocol."""
+
+  def __init__(self, handle: Any, worker_id: str = "trainer"):
+    self._handle = handle
+    self._info = datatypes.WorkerInfo(
+        worker_id=worker_id, roles=frozenset({"trainer"})
+    )
+
+  def info(self) -> datatypes.WorkerInfo:
+    return self._info
+
+  async def prepare_weight_sync(
+      self, sync_request: Any = None, **kwargs: Any
+  ) -> Sequence[weight_sync.WorkUnitMetadata]:
+    res = self._handle.asubmit("prepare_weight_sync", sync_request=sync_request, **kwargs)
+    if inspect.isawaitable(res):
+      res = await res
+    if isinstance(res, (list, tuple)):
+      return [m for m in res if isinstance(m, weight_sync.WorkUnitMetadata)]
+    if isinstance(res, weight_sync.WorkUnitMetadata):
+      return [res]
+    return []
+
+  async def release_weight_sync(
+      self, sync_request: Any = None, **kwargs: Any
+  ) -> Any:
+    res = self._handle.asubmit("release_weight_sync", sync_request=sync_request, **kwargs)
+    if inspect.isawaitable(res):
+      res = await res
+    return res
+
+
+class _ActorHandleDestinationAdapter(weight_sync.WeightSyncDestination):
+  """Adapts an ActorHandle to satisfy WeightSyncDestination protocol."""
+
+  def __init__(self, handle: Any, worker_id: str = "rollout"):
+    self._handle = handle
+    self._info = datatypes.WorkerInfo(
+        worker_id=worker_id, roles=frozenset({"rollout"})
+    )
+
+  def info(self) -> datatypes.WorkerInfo:
+    return self._info
+
+  async def bind_weight_sync(self, **kwargs: Any) -> None:
+    res = self._handle.asubmit("bind_weight_sync", **kwargs)
+    if inspect.isawaitable(res):
+      await res
+
+  async def get_weight_sync_metadata(
+      self, **kwargs: Any
+  ) -> Sequence[weight_sync.WorkUnitMetadata]:
+    res = self._handle.asubmit("get_weight_sync_metadata", **kwargs)
+    if inspect.isawaitable(res):
+      res = await res
+    if isinstance(res, (list, tuple)):
+      return [m for m in res if isinstance(m, weight_sync.WorkUnitMetadata)]
+    if isinstance(res, weight_sync.WorkUnitMetadata):
+      return [res]
+    return []
+
+  async def pre_weight_sync(
+      self, sync_request: Any = None, **kwargs: Any
+  ) -> Any:
+    res = self._handle.asubmit("pre_weight_sync", sync_request=sync_request, **kwargs)
+    if inspect.isawaitable(res):
+      res = await res
+    return res
+
+  async def weight_sync(
+      self, sync_request: Any = None, **kwargs: Any
+  ) -> Any:
+    res = self._handle.asubmit("weight_sync", sync_request=sync_request, **kwargs)
+    if inspect.isawaitable(res):
+      res = await res
+    return res
+
+  async def post_weight_sync(
+      self, sync_request: Any = None, **kwargs: Any
+  ) -> Any:
+    res = self._handle.asubmit("post_weight_sync", sync_request=sync_request, **kwargs)
+    if inspect.isawaitable(res):
+      res = await res
+    return res
+
+  async def abort_weight_sync(
+      self, sync_request: Any = None, **kwargs: Any
+  ) -> Any:
+    res = self._handle.asubmit("abort_weight_sync", sync_request=sync_request, **kwargs)
+    if inspect.isawaitable(res):
+      res = await res
+    return res
+
+  async def get_weight_sync_status(self) -> Mapping[str, Any]:
+    res = self._handle.asubmit("get_weight_sync_status")
+    if inspect.isawaitable(res):
+      res = await res
+    return dict(res) if isinstance(res, dict) else {}
+
+
 class DistributedRLEngine(rl_engine_interface.AbstractRLEngine):
   """Worker-backed compute router dispatching RPCs across role pools."""
 
   def __init__(
       self,
-      rollout_workers: Sequence[remote_execution.ActorHandle],
-      trainer_workers: Mapping[datatypes.Role, remote_execution.ActorHandle],
+      rollout_workers: Sequence[Any],
+      trainer_workers: Mapping[datatypes.Role, Any],
       inference_workers: (
-          Mapping[datatypes.Role, remote_execution.ActorHandle] | None
+          Mapping[datatypes.Role, Any] | None
       ) = None,
       weight_sync_handler: weight_sync.WeightSyncHandler | None = None,
   ):
-    self._rollout_workers = list(rollout_workers)
+    def _wrap_actor(w: Any) -> Any:
+      if isinstance(w, (str, remote_execution.ActorHandle)):
+        return w
+      return remote_execution.InProcessActorHandle(
+          remote_execution.InProcessRemoteExecutionServer(instance=w)
+      )
+
+    self._rollout_workers = [_wrap_actor(w) for w in rollout_workers]
     self._rollout_pool = remote_execution.RoutingActorPool(
         self._rollout_workers
     )
-    self._trainer_workers = dict(trainer_workers)
-    self._inference_workers = dict(inference_workers or {})
+    self._trainer_workers = {
+        k: _wrap_actor(v) for k, v in trainer_workers.items()
+    }
+    self._inference_workers = {
+        k: _wrap_actor(v) for k, v in (inference_workers or {}).items()
+    }
     self._weight_sync_handler = weight_sync_handler
     self._policy_version: int = 0
+
+  @property
+  def policy_version(self) -> int:
+    """Returns the current policy version number."""
+    return self._policy_version
 
   async def _invoke_worker(
       self,
@@ -347,107 +464,6 @@ class DistributedRLEngine(rl_engine_interface.AbstractRLEngine):
         "train_step": train_step,
         "accumulated": accumulate_gradients,
     }
-
-class _ActorHandleSourceAdapter:
-  """Adapts an ActorHandle to satisfy WeightSyncSource protocol."""
-
-  def __init__(self, handle: Any, worker_id: str = "trainer"):
-    self._handle = handle
-    self._info = datatypes.WorkerInfo(
-        worker_id=worker_id, roles=frozenset({"trainer"})
-    )
-
-  def info(self) -> datatypes.WorkerInfo:
-    return self._info
-
-  async def prepare_weight_sync(
-      self, sync_request: Any = None, **kwargs: Any
-  ) -> Sequence[weight_sync.WorkUnitMetadata]:
-    res = self._handle.asubmit("prepare_weight_sync", sync_request=sync_request, **kwargs)
-    if inspect.isawaitable(res):
-      res = await res
-    if isinstance(res, (list, tuple)):
-      return [m for m in res if isinstance(m, weight_sync.WorkUnitMetadata)]
-    if isinstance(res, weight_sync.WorkUnitMetadata):
-      return [res]
-    return []
-
-  async def release_weight_sync(
-      self, sync_request: Any = None, **kwargs: Any
-  ) -> Any:
-    res = self._handle.asubmit("release_weight_sync", sync_request=sync_request, **kwargs)
-    if inspect.isawaitable(res):
-      res = await res
-    return res
-
-
-class _ActorHandleDestinationAdapter:
-  """Adapts an ActorHandle to satisfy WeightSyncDestination protocol."""
-
-  def __init__(self, handle: Any, worker_id: str = "rollout"):
-    self._handle = handle
-    self._info = datatypes.WorkerInfo(
-        worker_id=worker_id, roles=frozenset({"rollout"})
-    )
-
-  def info(self) -> datatypes.WorkerInfo:
-    return self._info
-
-  async def bind_weight_sync(self, **kwargs: Any) -> None:
-    res = self._handle.asubmit("bind_weight_sync", **kwargs)
-    if inspect.isawaitable(res):
-      await res
-
-  async def get_weight_sync_metadata(
-      self, **kwargs: Any
-  ) -> Sequence[weight_sync.WorkUnitMetadata]:
-    res = self._handle.asubmit("get_weight_sync_metadata", **kwargs)
-    if inspect.isawaitable(res):
-      res = await res
-    if isinstance(res, (list, tuple)):
-      return [m for m in res if isinstance(m, weight_sync.WorkUnitMetadata)]
-    if isinstance(res, weight_sync.WorkUnitMetadata):
-      return [res]
-    return []
-
-  async def pre_weight_sync(
-      self, sync_request: Any = None, **kwargs: Any
-  ) -> Any:
-    res = self._handle.asubmit("pre_weight_sync", sync_request=sync_request, **kwargs)
-    if inspect.isawaitable(res):
-      res = await res
-    return res
-
-  async def weight_sync(
-      self, sync_request: Any = None, **kwargs: Any
-  ) -> Any:
-    res = self._handle.asubmit("weight_sync", sync_request=sync_request, **kwargs)
-    if inspect.isawaitable(res):
-      res = await res
-    return res
-
-  async def post_weight_sync(
-      self, sync_request: Any = None, **kwargs: Any
-  ) -> Any:
-    res = self._handle.asubmit("post_weight_sync", sync_request=sync_request, **kwargs)
-    if inspect.isawaitable(res):
-      res = await res
-    return res
-
-  async def abort_weight_sync(
-      self, sync_request: Any = None, **kwargs: Any
-  ) -> Any:
-    res = self._handle.asubmit("abort_weight_sync", sync_request=sync_request, **kwargs)
-    if inspect.isawaitable(res):
-      res = await res
-    return res
-
-  async def get_weight_sync_status(self) -> Mapping[str, Any]:
-    res = self._handle.asubmit("get_weight_sync_status")
-    if inspect.isawaitable(res):
-      res = await res
-    return dict(res) if isinstance(res, dict) else {}
-
 
   async def sync_weights(  # pyrefly: ignore[bad-override]
       self,

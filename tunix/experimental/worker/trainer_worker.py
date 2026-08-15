@@ -245,7 +245,6 @@ class TrainerWorker(abstract_worker.Worker):
       metadata = self._trainer.prepare_weight_sync(
           sync_request=sync_request, **kwargs_to_pass
       )
-      self.state = WorkerState.READY
       self._last_error = None
       if metadata is not None:
         return metadata
