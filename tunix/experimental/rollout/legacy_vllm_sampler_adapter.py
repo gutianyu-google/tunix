@@ -358,7 +358,7 @@ class LegacyVllmSamplerAdapter(Sampler, abc.ABC):
     except Exception:
       has_raiden = False
 
-    if has_raiden and mesh is not None and not getattr(self, "_dst_ws", None):
+    if mesh is not None and not getattr(self, "_dst_ws", None) and not getattr(self, "_dst_ws_info", None):
       try:
         arrays: list[jax.Array] = []
         names: list[str] = []
@@ -394,16 +394,87 @@ class LegacyVllmSamplerAdapter(Sampler, abc.ABC):
         self._dst_staging_arrays = arrays
         self._dst_variable_names = names
 
-        from tpu_raiden.api.jax.weight_synchronizer import WeightSynchronizer  # pylint: disable=g-import-not-at-top
-        self._dst_ws = WeightSynchronizer(
-            jax_arrays=self._dst_staging_arrays,
-            parallelism=16,
-            listener_port=0,
-            unsafe_skip_buffer_lock=True,
+        backend = (
+            kwargs.get("backend")
+            or os.environ.get("TUNIX_WEIGHT_SYNC_BACKEND")
+            or (
+                "pathways"
+                if (
+                    "proxy" in os.environ.get("JAX_PLATFORMS", "")
+                    or os.environ.get("JAX_BACKEND_TARGET")
+                )
+                else "local_launcher"
+            )
         )
+
+        if backend == "pathways":
+          self._bind_weight_sync_pathways(
+              arrays=self._dst_staging_arrays, mesh=mesh, **kwargs
+          )
+        else:
+          self._bind_weight_sync_local_launcher(
+              arrays=self._dst_staging_arrays, mesh=mesh, **kwargs
+          )
       except Exception as err:
         logging.warning("Raiden destination binding fallback: %r", err)
         self._dst_ws = None
+        self._dst_ws_info = None
+
+  def _bind_weight_sync_local_launcher(
+      self, arrays: Sequence[jax.Array], mesh: Any, **kwargs
+  ) -> None:
+    """Binds Raiden weight sync via WeightSynchronizer API for local launcher backend."""
+    from tpu_raiden.api.jax.weight_synchronizer import WeightSynchronizer  # pylint: disable=g-import-not-at-top
+    self._dst_ws = WeightSynchronizer(
+        jax_arrays=arrays,
+        parallelism=int(kwargs.get("parallelism", 16)),
+        listener_port=0,
+        unsafe_skip_buffer_lock=True,
+    )
+
+  def _bind_weight_sync_pathways(
+      self, arrays: Sequence[jax.Array], mesh: Any, **kwargs
+  ) -> None:
+    """Binds Raiden weight sync via weight_synchronizer_ffi for Pathways backend."""
+    from tpu_raiden.frameworks.jax import weight_synchronizer_ffi as raiden_ffi  # pylint: disable=g-import-not-at-top
+    local_device_count = (
+        len(mesh.local_devices)
+        if hasattr(mesh, "local_devices")
+        else len(mesh.devices.flatten())
+    )
+    dst_slice_sizes = [
+        int(
+            np.prod(
+                getattr(arr, "sharding", None).shard_shape(arr.shape)
+                if hasattr(getattr(arr, "sharding", None), "shard_shape")
+                else arr.shape
+            )
+        )
+        * arr.dtype.itemsize
+        for arr in arrays
+    ]
+    dst_sizes_sharded = jax.device_put(
+        np.array(dst_slice_sizes, dtype=np.int32),
+        shd.NamedSharding(mesh, shd.PartitionSpec(None)),
+    )
+    dst_global_ids = np.arange(mesh.devices.size, dtype=np.int32).reshape(
+        mesh.devices.shape
+    )
+    dst_shard_idx = jax.device_put(
+        dst_global_ids,
+        shd.NamedSharding(mesh, shd.PartitionSpec(*mesh.axis_names)),
+    )
+    self._dst_ws_info = raiden_ffi.init_weight_synchronizer(
+        device_arrays=arrays,
+        shard_idx=dst_shard_idx,
+        mesh=mesh,
+        slice_byte_sizes=dst_sizes_sharded,
+        parallelism=int(kwargs.get("parallelism", 16)),
+        num_layers=len(arrays),
+        listener_port=0,
+        num_shards=local_device_count,
+    )
+    self._dst_ws_info.block_until_ready()
 
   async def get_weight_sync_metadata(
       self, **kwargs
@@ -428,6 +499,20 @@ class LegacyVllmSamplerAdapter(Sampler, abc.ABC):
     if getattr(self, "_dst_ws", None) is not None:
       dst_ips = [f"127.0.0.1:{self._dst_ws.local_port}"]
       dst_listener = f"127.0.0.1:{self._dst_ws.listener_port}"
+    elif getattr(self, "_dst_ws_info", None) is not None:
+      def _unpack_ip(row: np.ndarray) -> str:
+        raw_bytes = row[:4].astype(np.int32).tobytes()
+        try:
+          ip_obj = ipaddress.IPv6Address(raw_bytes)
+          if ip_obj.ipv4_mapped is not None:
+            return str(ip_obj.ipv4_mapped)
+          return f"[{ip_obj}]" if ":" in str(ip_obj) else str(ip_obj)
+        except Exception:
+          return "127.0.0.1"
+
+      dst_info_np = np.asarray(self._dst_ws_info).reshape(-1, 6)
+      dst_ips = [f"{_unpack_ip(row)}:{row[4]}" for row in dst_info_np]
+      dst_listener = f"{_unpack_ip(dst_info_np[0])}:{dst_info_np[0][5]}"
     else:
       num_devices = 1
       if mesh is not None and hasattr(mesh, "devices"):

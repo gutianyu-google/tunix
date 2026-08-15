@@ -1236,20 +1236,31 @@ class PeftTrainer(abstract_trainer.AbstractTrainer):
       physical_mesh_shape = (1, 1)
       mesh_axes = ("data", "fsdp")
 
+    backend = (
+        kwargs.get("backend")
+        or os.environ.get("TUNIX_WEIGHT_SYNC_BACKEND")
+        or (
+            "pathways"
+            if (
+                "proxy" in os.environ.get("JAX_PLATFORMS", "")
+                or os.environ.get("JAX_BACKEND_TARGET")
+            )
+            else "local_launcher"
+        )
+    )
+
     try:
-      from tpu_raiden.api.jax.weight_synchronizer import WeightSynchronizer  # pylint: disable=g-import-not-at-top
-      self._src_ws = WeightSynchronizer(
-          jax_arrays=arrays,
-          parallelism=int(kwargs.get("parallelism", 16)),
-          listener_port=0,
-          unsafe_skip_buffer_lock=True,
-      )
-      self._src_ws.d2h()
-      src_ips = [f"127.0.0.1:{self._src_ws.local_port}"]
-      src_listener = f"127.0.0.1:{self._src_ws.listener_port}"
+      if backend == "pathways":
+        src_ips, src_listener = self._prepare_weight_sync_pathways(
+            arrays=arrays, mesh=mesh, **kwargs
+        )
+      else:
+        src_ips, src_listener = self._prepare_weight_sync_local_launcher(
+            arrays=arrays, mesh=mesh, **kwargs
+        )
     except Exception as err:
       logging.warning(
-          "Raiden WeightSynchronizer prepare_weight_sync fallback: %r", err
+          "Raiden prepare_weight_sync (%s) fallback: %r", backend, err
       )
       src_ips = [
           f"127.0.0.1:{29500 + i}"
@@ -1271,6 +1282,81 @@ class PeftTrainer(abstract_trainer.AbstractTrainer):
         variables=tuple(tensor_metadatas),
     )
     return [work_unit]
+
+  def _prepare_weight_sync_local_launcher(
+      self, arrays: Sequence[jax.Array], mesh: Any, **kwargs
+  ) -> tuple[Sequence[str], str]:
+    """Prepares Raiden weight sync via WeightSynchronizer API for local launcher backend."""
+    from tpu_raiden.api.jax.weight_synchronizer import WeightSynchronizer  # pylint: disable=g-import-not-at-top
+    self._src_ws = WeightSynchronizer(
+        jax_arrays=arrays,
+        parallelism=int(kwargs.get("parallelism", 16)),
+        listener_port=0,
+        unsafe_skip_buffer_lock=True,
+    )
+    self._src_ws.d2h()
+    src_ips = [f"127.0.0.1:{self._src_ws.local_port}"]
+    src_listener = f"127.0.0.1:{self._src_ws.listener_port}"
+    return src_ips, src_listener
+
+  def _prepare_weight_sync_pathways(
+      self, arrays: Sequence[jax.Array], mesh: Any, **kwargs
+  ) -> tuple[Sequence[str], str]:
+    """Prepares Raiden weight sync via weight_synchronizer_ffi for Pathways backend."""
+    from tpu_raiden.frameworks.jax import weight_synchronizer_ffi as raiden_ffi  # pylint: disable=g-import-not-at-top
+
+    def _unpack_ip(row: np.ndarray) -> str:
+      raw_bytes = row[:4].astype(np.int32).tobytes()
+      try:
+        ip_obj = ipaddress.IPv6Address(raw_bytes)
+        if ip_obj.ipv4_mapped is not None:
+          return str(ip_obj.ipv4_mapped)
+        return f"[{ip_obj}]" if ":" in str(ip_obj) else str(ip_obj)
+      except Exception:
+        return "127.0.0.1"
+
+    local_device_count = (
+        len(mesh.local_devices)
+        if hasattr(mesh, "local_devices")
+        else len(mesh.devices.flatten())
+    )
+    src_slice_sizes = [
+        int(
+            np.prod(
+                getattr(arr, "sharding", None).shard_shape(arr.shape)
+                if hasattr(getattr(arr, "sharding", None), "shard_shape")
+                else arr.shape
+            )
+        )
+        * arr.dtype.itemsize
+        for arr in arrays
+    ]
+    src_sizes_sharded = jax.device_put(
+        np.array(src_slice_sizes, dtype=np.int32),
+        shd.NamedSharding(mesh, shd.PartitionSpec(None)),
+    )
+    src_global_ids = np.arange(mesh.devices.size, dtype=np.int32).reshape(
+        mesh.devices.shape
+    )
+    src_shard_idx = jax.device_put(
+        src_global_ids,
+        shd.NamedSharding(mesh, shd.PartitionSpec(*mesh.axis_names)),
+    )
+    src_ws_info = raiden_ffi.init_weight_synchronizer_and_d2h(
+        device_arrays=arrays,
+        shard_idx=src_shard_idx,
+        mesh=mesh,
+        slice_byte_sizes=src_sizes_sharded,
+        parallelism=int(kwargs.get("parallelism", 16)),
+        num_layers=len(arrays),
+        listener_port=0,
+        num_shards=local_device_count,
+    )
+    src_ws_info.block_until_ready()
+    src_info_np = np.asarray(src_ws_info).reshape(-1, 6)
+    src_ips = [f"{_unpack_ip(row)}:{row[4]}" for row in src_info_np]
+    src_listener = f"{_unpack_ip(src_info_np[0])}:{src_info_np[0][5]}"
+    return src_ips, src_listener
 
   @override
   def release_weight_sync(self, sync_request: Any = None, **kwargs) -> None:
