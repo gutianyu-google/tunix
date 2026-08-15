@@ -110,10 +110,7 @@ def _has_direct_safetensors(model_path: Path) -> bool:
 
 def _ensure_model_dir_for_trainer(model_dir: str, model_id: str) -> str:
   if not model_dir:
-    raise ValueError(
-        "--model_dir is required for JAX trainer weights. Set MODEL_DIR or pass "
-        "--model_dir=/path/to/local/qwen3/safetensors."
-    )
+    model_dir = "artifacts/qwen3_dist_gsm8k/models"
 
   model_path = Path(model_dir).expanduser()
   if model_path.exists() and not model_path.is_dir():

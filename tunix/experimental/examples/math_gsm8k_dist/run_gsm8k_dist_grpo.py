@@ -355,6 +355,8 @@ def main(argv: list[str], context: Any = None) -> None:
   logging.info("Control-plane JAX backend: %s", jax.default_backend())
 
   tokenizer_path = args.tokenizer_path or os.getenv("MODEL_DIR") or args.model_id
+  if not os.path.exists(tokenizer_path):
+    tokenizer_path = args.model_id
   tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, trust_remote_code=True)
   if tokenizer.pad_token_id is None and tokenizer.eos_token is not None:
     tokenizer.pad_token = tokenizer.eos_token

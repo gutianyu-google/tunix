@@ -25,6 +25,7 @@ import argparse
 import asyncio
 import logging
 import os
+from pathlib import Path
 import pickle
 import sys
 
@@ -148,13 +149,46 @@ class _GSM8KDemoAgent(base_agent.ConversationAgentBase):
     return action
 
 
+def _has_direct_safetensors(model_path: Path) -> bool:
+  return any(model_path.glob("*.safetensors"))
+
+
+def _ensure_model_dir_for_rollout(model_dir: str, model_id: str) -> str:
+  if not model_dir:
+    model_dir = "artifacts/qwen3_dist_gsm8k/models"
+
+  model_path = Path(model_dir).expanduser()
+  if model_path.exists() and not model_path.is_dir():
+    raise ValueError(
+        f"--model_dir must point to an existing directory. Got: {model_dir}"
+    )
+
+  if _has_direct_safetensors(model_path):
+    return str(model_path)
+
+  logging.info(
+      "No direct safetensors found in %s. Downloading %s for rollout worker...",
+      model_path,
+      model_id,
+  )
+  model_path.mkdir(parents=True, exist_ok=True)
+  from tunix.oss import utils as oss_utils  # pylint: disable=g-import-not-at-top
+
+  oss_utils.hf_pipeline(model_id, str(model_path))
+  return str(model_path)
+
+
 def _create_vllm_worker(args, tokenizer):
   logging.info("Creating vLLM mapping config...")
   mapping_config = mappings_lib.MappingConfig(
       to_hf_mappings=mapping_vllm_jax.TO_HF_MAPPINGS,
       lora_to_hf_mappings=mapping_vllm_jax.LORA_TO_HF_MAPPINGS,
   )
-  vllm_model = args.model_dir or args.model_id
+  vllm_model = (
+      args.model_dir
+      if (args.model_dir and os.path.exists(args.model_dir))
+      else args.model_id
+  )
   rollout_mesh = _create_rollout_mesh()
   max_model_len = args.max_prompt_length + args.max_response_length
   logging.info(
@@ -233,6 +267,9 @@ def main(argv: list[str], context: Any = None) -> None:
   args = _parse_args(argv)
   logging.info("Parsed args: %s", args)
 
+  args.model_dir = _ensure_model_dir_for_rollout(args.model_dir, args.model_id)
+  logging.info("Prepared rollout safetensors directory: %s", args.model_dir)
+
   if context:
     context.jax.initialize()
   os.environ.setdefault("VLLM_ALLOW_LONG_MAX_MODEL_LEN", "1")
@@ -244,6 +281,8 @@ def main(argv: list[str], context: Any = None) -> None:
 
 
   tokenizer_path = args.tokenizer_path or args.model_dir or args.model_id
+  if not os.path.exists(tokenizer_path):
+    tokenizer_path = args.model_id
   logging.info("Loading tokenizer from %s...", tokenizer_path)
   tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, trust_remote_code=True)
   if tokenizer.pad_token_id is None and tokenizer.eos_token is not None:
