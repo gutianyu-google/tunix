@@ -19,6 +19,7 @@ import contextlib
 import dataclasses
 import functools
 import ipaddress
+import os
 import time
 from typing import Any, Callable, Concatenate, Dict, List, ParamSpec, Sequence, Tuple
 
@@ -38,6 +39,24 @@ from tunix.experimental.common import datatypes
 from tunix.experimental.metrics import metrics as exp_metrics
 from tunix.experimental.orchestrator import weight_sync
 from tunix.experimental.train import abstract_trainer
+
+
+def _patch_jax_compute_on():
+  try:
+    from jax.experimental import compute_on  # pylint: disable=g-import-not-at-top
+    orig_fn = getattr(compute_on, "compute_on", None)
+    if orig_fn is not None and not getattr(compute_on, "_is_patched_for_raiden", False):
+      @contextlib.contextmanager
+      def _compat_compute_on(compute_type: str = "device_host", *args, **kwargs):
+        del args, kwargs
+        with orig_fn(str(compute_type)):
+          yield
+      compute_on.compute_on = _compat_compute_on
+      compute_on._is_patched_for_raiden = True
+  except Exception:
+    pass
+
+_patch_jax_compute_on()
 from tunix.perf import metrics as perf_metrics
 from tunix.perf import trace as perf_trace
 from tunix.perf.experimental import constants as perf_constants
@@ -1315,12 +1334,7 @@ class PeftTrainer(abstract_trainer.AbstractTrainer):
       except Exception:
         return "127.0.0.1"
 
-    local_device_count = (
-        len(mesh.local_devices)
-        if hasattr(mesh, "local_devices")
-        else len(mesh.devices.flatten())
-    )
-    src_slice_sizes = [
+    max_slice_size = max(
         int(
             np.prod(
                 getattr(arr, "sharding", None).shard_shape(arr.shape)
@@ -1330,10 +1344,6 @@ class PeftTrainer(abstract_trainer.AbstractTrainer):
         )
         * arr.dtype.itemsize
         for arr in arrays
-    ]
-    src_sizes_sharded = jax.device_put(
-        np.array(src_slice_sizes, dtype=np.int32),
-        shd.NamedSharding(mesh, shd.PartitionSpec(None)),
     )
     src_global_ids = np.arange(mesh.devices.size, dtype=np.int32).reshape(
         mesh.devices.shape
@@ -1343,14 +1353,13 @@ class PeftTrainer(abstract_trainer.AbstractTrainer):
         shd.NamedSharding(mesh, shd.PartitionSpec(*mesh.axis_names)),
     )
     src_ws_info = raiden_ffi.init_weight_synchronizer_and_d2h(
-        device_arrays=arrays,
+        device_array=arrays[0],
         shard_idx=src_shard_idx,
         mesh=mesh,
-        slice_byte_sizes=src_sizes_sharded,
+        slice_byte_size=max_slice_size,
         parallelism=int(kwargs.get("parallelism", 16)),
         num_layers=len(arrays),
         listener_port=0,
-        num_shards=local_device_count,
     )
     src_ws_info.block_until_ready()
     src_info_np = np.asarray(src_ws_info).reshape(-1, 6)

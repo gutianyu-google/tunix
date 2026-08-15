@@ -21,8 +21,10 @@ except Exception:
 
 import abc
 import asyncio
+import contextlib
 import ipaddress
 import numbers
+import os
 import re
 from typing import Any, List, Mapping, Sequence
 from absl import logging
@@ -36,6 +38,24 @@ from tunix.experimental.orchestrator import weight_sync_coordinator
 from tunix.experimental.rollout import sampler as base_sampler_lib
 
 Sampler = base_sampler_lib.Sampler
+
+
+def _patch_jax_compute_on():
+  try:
+    from jax.experimental import compute_on  # pylint: disable=g-import-not-at-top
+    orig_fn = getattr(compute_on, "compute_on", None)
+    if orig_fn is not None and not getattr(compute_on, "_is_patched_for_raiden", False):
+      @contextlib.contextmanager
+      def _compat_compute_on(compute_type: str = "device_host", *args, **kwargs):
+        del args, kwargs
+        with orig_fn(str(compute_type)):
+          yield
+      compute_on.compute_on = _compat_compute_on
+      compute_on._is_patched_for_raiden = True
+  except Exception:
+    pass
+
+_patch_jax_compute_on()
 
 
 def _get_vllm_sampler_cls():
@@ -341,7 +361,7 @@ class LegacyVllmSamplerAdapter(Sampler, abc.ABC):
     return responses[0]
 
   # --- Weight Synchronization (WeightSyncDestination) ---
-  async def bind_weight_sync(self) -> None:
+  async def bind_weight_sync(self, **kwargs) -> None:
     """Binds destination-side transport resources."""
     if self.vllm_sampler is None:
       self.initialize()
@@ -437,12 +457,7 @@ class LegacyVllmSamplerAdapter(Sampler, abc.ABC):
   ) -> None:
     """Binds Raiden weight sync via weight_synchronizer_ffi for Pathways backend."""
     from tpu_raiden.frameworks.jax import weight_synchronizer_ffi as raiden_ffi  # pylint: disable=g-import-not-at-top
-    local_device_count = (
-        len(mesh.local_devices)
-        if hasattr(mesh, "local_devices")
-        else len(mesh.devices.flatten())
-    )
-    dst_slice_sizes = [
+    max_slice_size = max(
         int(
             np.prod(
                 getattr(arr, "sharding", None).shard_shape(arr.shape)
@@ -452,10 +467,6 @@ class LegacyVllmSamplerAdapter(Sampler, abc.ABC):
         )
         * arr.dtype.itemsize
         for arr in arrays
-    ]
-    dst_sizes_sharded = jax.device_put(
-        np.array(dst_slice_sizes, dtype=np.int32),
-        shd.NamedSharding(mesh, shd.PartitionSpec(None)),
     )
     dst_global_ids = np.arange(mesh.devices.size, dtype=np.int32).reshape(
         mesh.devices.shape
@@ -465,14 +476,13 @@ class LegacyVllmSamplerAdapter(Sampler, abc.ABC):
         shd.NamedSharding(mesh, shd.PartitionSpec(*mesh.axis_names)),
     )
     self._dst_ws_info = raiden_ffi.init_weight_synchronizer(
-        device_arrays=arrays,
+        device_array=arrays[0],
         shard_idx=dst_shard_idx,
         mesh=mesh,
-        slice_byte_sizes=dst_sizes_sharded,
+        slice_byte_size=max_slice_size,
         parallelism=int(kwargs.get("parallelism", 16)),
         num_layers=len(arrays),
         listener_port=0,
-        num_shards=local_device_count,
     )
     self._dst_ws_info.block_until_ready()
 
