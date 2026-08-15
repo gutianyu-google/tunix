@@ -120,9 +120,7 @@ This document tracks all fixes, issues encountered, root causes, and resolutions
   - `tunix/experimental/train/peft_trainer_v2.py`
   - `tunix/experimental/rollout/legacy_vllm_sampler_adapter.py`
 
----
-
-## 5. End-to-End Distributed Verification Results
+## 5. End-to-End Distributed Verification Results (Single-Host TPU-VM)
 
 - **VM Topology**: Single-host TPU v6e (8 chips) on `t1v-n-b4c22492-w-0` (`asia-northeast1-b`).
 - **Process Allocation**:
@@ -138,4 +136,23 @@ This document tracks all fixes, issues encountered, root causes, and resolutions
   6. **Metrics**:
      - `step=0 policy_version=1 rollouts=4 microbatches=4 reward_mean=0.500 reward_std=0.500`
      - Status: `Distributed GSM8K GRPO chain demo (vLLM) finished successfully.`
+
+---
+
+## 6. GKE Multi-Slice Cluster (`auto-v5p-8-bodaborg`) Deployment & Analysis
+
+- **Cluster Topology**:
+  - GKE Cluster: `auto-v5p-8-bodaborg` (`europe-west4-a`, Project: `cloud-tpu-multipod-dev`).
+  - Node Pools:
+    - Trainer Slice: `tpu-v5p-slice` (4 chips per host, `ct5p-hightpu-4t`, JobSet `mohitkhatwani-train`).
+    - Rollout Slice: `tpu-v5p-slice` (4 chips per host, `ct5p-hightpu-4t`, JobSet `mohitkhatwani-roll`).
+    - Orchestrator: CPU node pool (`default-pool`, JobSet `mohitkhatwani-orch`).
+- **Container Image**: `gcr.io/tpu-prod-env-multipod/mohitkhatwani-trellis:raiden-0814`.
+- **Infrastructure Architecture Findings**:
+  1. **Dual-Backend Support**: Added separate, modular weight synchronization functions:
+     - `_bind_weight_sync_local_launcher()` & `_prepare_weight_sync_local_launcher()`: Native PJRT C++ `WeightSynchronizer` for single-host TPU VMs.
+     - `_bind_weight_sync_pathways()` & `_prepare_weight_sync_pathways()`: JAX FFI device-host synchronization for Shared Pathways Service (SPS).
+  2. **gRPC Keepalive Tuning**: Added `grpc.http2.min_recv_ping_interval_without_data_ms=5000` and `grpc.http2.max_ping_strikes=0` in `tunix/experimental/worker/remote_execution.py` to eliminate `ENHANCE_YOUR_CALM (too_many_pings)` GOAWAY disconnects across Kubernetes pod services.
+  3. **Pathways FFI Custom Call Scope**: On SPS / Pathways backend slices, TPU operations run on the remote Pathways server daemon (`server:latest`). When running with Pathways, low-level FFI custom calls require the C++ SO to be linked into the Pathways server image, while the high-level `WeightSynchronizer` and coordinator transport operate seamlessly in direct host-to-host container topologies.
+
 
