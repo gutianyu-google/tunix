@@ -16,6 +16,11 @@
 
 from __future__ import annotations
 
+try:
+  import tpu_raiden.frameworks.jax._tpu_raiden_jax  # Preload raiden C++ module before JAX/vLLM init
+except Exception:
+  pass
+
 import argparse
 import asyncio
 import logging
@@ -146,7 +151,8 @@ class _GSM8KDemoAgent(base_agent.ConversationAgentBase):
 def _create_vllm_worker(args, tokenizer):
   logging.info("Creating vLLM mapping config...")
   mapping_config = mappings_lib.MappingConfig(
-      lora_to_hf_mappings=mapping_vllm_jax.LORA_TO_HF_MAPPINGS
+      to_hf_mappings=mapping_vllm_jax.TO_HF_MAPPINGS,
+      lora_to_hf_mappings=mapping_vllm_jax.LORA_TO_HF_MAPPINGS,
   )
   vllm_model = args.model_dir or args.model_id
   rollout_mesh = _create_rollout_mesh()
@@ -163,7 +169,7 @@ def _create_vllm_worker(args, tokenizer):
       mesh=rollout_mesh,
       tensor_parallel_size=jax.device_count(),
       data_parallel_size=1,
-      return_logprobs=True,
+      return_logprobs=False,
       lora_config=(
           {
               "max_lora_rank": args.lora_rank,
@@ -176,6 +182,7 @@ def _create_vllm_worker(args, tokenizer):
       engine_kwargs={
           "model": vllm_model,
           "max_model_len": max_model_len,
+          "generation_config": "vllm",
       },
   )
   sampler_adapter = legacy_vllm_sampler_adapter.LegacyVllmSamplerAdapter(
@@ -192,9 +199,9 @@ def _create_vllm_worker(args, tokenizer):
       sampler_type="legacy_vllm",
       max_prompt_length=args.max_prompt_length,
       max_tokens_to_generate=args.max_response_length,
-      temperature=1.0,
+      temperature=0.0,
       top_p=1.0,
-      return_logprobs=True,
+      return_logprobs=False,
       rollout_vllm_model_version=vllm_model,
   )
   return rollout_worker.RolloutWorker(

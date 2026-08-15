@@ -16,6 +16,11 @@
 
 from __future__ import annotations
 
+try:
+  import tpu_raiden.frameworks.jax._tpu_raiden_jax  # Preload raiden C++ module before JAX/NNX init
+except Exception:
+  pass
+
 import argparse
 import asyncio
 import contextlib

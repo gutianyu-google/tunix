@@ -108,7 +108,7 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
   parser.add_argument("--train_micro_batch_size", type=int, default=1)
   parser.add_argument("--model_id", type=str, default="Qwen/Qwen3-1.7B")
   parser.add_argument("--tokenizer_path", type=str, default="")
-  parser.add_argument("--temperature", type=float, default=1.0)
+  parser.add_argument("--temperature", type=float, default=0.0)
   parser.add_argument("--top_p", type=float, default=1.0)
   parser.add_argument("--top_k", type=int, default=-1)
   parser.add_argument("--beta", type=float, default=0.0)
@@ -292,7 +292,7 @@ def _build_step_requests(
                   "temperature": temperature,
                   "top_p": top_p,
                   "top_k": top_k,
-                  "return_logprobs": True,
+                  "return_logprobs": False,
               },
               metadata={
                   "group_id": prompt_id,
