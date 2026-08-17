@@ -456,6 +456,36 @@ class LegacyVllmSamplerAdapter(Sampler, abc.ABC):
       self, arrays: Sequence[jax.Array], mesh: Any, **kwargs
   ) -> None:
     """Binds Raiden weight sync via weight_synchronizer_ffi for Pathways backend."""
+    try:
+      from jax.experimental import compute_on  # pylint: disable=g-import-not-at-top
+      orig = compute_on.compute_on
+      if not getattr(orig, "_is_tunix_raiden_wrapped", False):
+        def _wrapped(compute_type: str = "device_host", **kwargs):
+          del kwargs
+          ctx = orig(compute_type)
+
+          class _DecoratorContextManager:
+
+            def __enter__(self):
+              return ctx.__enter__()
+
+            def __exit__(self, *exc):
+              return ctx.__exit__(*exc)
+
+            def __call__(self, fn):
+              def _inner(*args, **fn_kwargs):
+                with orig(compute_type):
+                  return fn(*args, **fn_kwargs)
+
+              return _inner
+
+          return _DecoratorContextManager()
+
+        _wrapped._is_tunix_raiden_wrapped = True  # pylint: disable=protected-access
+        compute_on.compute_on = _wrapped
+    except Exception:  # pylint: disable=broad-exception-caught
+      pass
+
     from tpu_raiden.frameworks.jax import weight_synchronizer_ffi as raiden_ffi  # pylint: disable=g-import-not-at-top
     max_slice_size = max(
         int(
@@ -475,11 +505,13 @@ class LegacyVllmSamplerAdapter(Sampler, abc.ABC):
         dst_global_ids,
         shd.NamedSharding(mesh, shd.PartitionSpec(*mesh.axis_names)),
     )
+    slice_byte_sizes = jnp.array([max_slice_size] * len(arrays), dtype=jnp.int32)
     self._dst_ws_info = raiden_ffi.init_weight_synchronizer(
         device_array=arrays[0],
         shard_idx=dst_shard_idx,
         mesh=mesh,
-        slice_byte_size=max_slice_size,
+        slice_byte_sizes=slice_byte_sizes,
+        local_port=0,
         parallelism=int(kwargs.get("parallelism", 16)),
         num_layers=len(arrays),
         listener_port=0,

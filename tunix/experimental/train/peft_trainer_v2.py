@@ -39,24 +39,6 @@ from tunix.experimental.common import datatypes
 from tunix.experimental.metrics import metrics as exp_metrics
 from tunix.experimental.orchestrator import weight_sync
 from tunix.experimental.train import abstract_trainer
-
-
-def _patch_jax_compute_on():
-  try:
-    from jax.experimental import compute_on  # pylint: disable=g-import-not-at-top
-    orig_fn = getattr(compute_on, "compute_on", None)
-    if orig_fn is not None and not getattr(compute_on, "_is_patched_for_raiden", False):
-      @contextlib.contextmanager
-      def _compat_compute_on(compute_type: str = "device_host", *args, **kwargs):
-        del args, kwargs
-        with orig_fn(str(compute_type)):
-          yield
-      compute_on.compute_on = _compat_compute_on
-      compute_on._is_patched_for_raiden = True
-  except Exception:
-    pass
-
-_patch_jax_compute_on()
 from tunix.perf import metrics as perf_metrics
 from tunix.perf import trace as perf_trace
 from tunix.perf.experimental import constants as perf_constants
@@ -75,6 +57,41 @@ _ModelInputT = dict[str, ArrayLike]
 P = ParamSpec("P")
 MetricsLogger = sft_metrics_logger.MetricsLogger
 MetricsLoggerOptions = sft_metrics_logger.MetricsLoggerOptions
+
+
+def _patch_jax_compute_on() -> None:
+  """Adapts JAX compute_on context manager for TPU Raiden decorator usage."""
+  try:
+    from jax.experimental import compute_on  # pylint: disable=g-import-not-at-top
+    orig = compute_on.compute_on
+    if getattr(orig, "_is_tunix_raiden_wrapped", False):
+      return
+
+    def _wrapped(compute_type: str = "device_host", **kwargs):
+      del kwargs
+      ctx = orig(compute_type)
+
+      class _DecoratorContextManager:
+
+        def __enter__(self):
+          return ctx.__enter__()
+
+        def __exit__(self, *exc):
+          return ctx.__exit__(*exc)
+
+        def __call__(self, fn):
+          def _inner(*args, **fn_kwargs):
+            with orig(compute_type):
+              return fn(*args, **fn_kwargs)
+
+          return _inner
+
+      return _DecoratorContextManager()
+
+    _wrapped._is_tunix_raiden_wrapped = True  # pylint: disable=protected-access
+    compute_on.compute_on = _wrapped
+  except Exception:  # pylint: disable=broad-exception-caught
+    pass
 
 
 @dataclasses.dataclass(slots=True, kw_only=True)
@@ -1322,6 +1339,7 @@ class PeftTrainer(abstract_trainer.AbstractTrainer):
       self, arrays: Sequence[jax.Array], mesh: Any, **kwargs
   ) -> tuple[Sequence[str], str]:
     """Prepares Raiden weight sync via weight_synchronizer_ffi for Pathways backend."""
+    _patch_jax_compute_on()
     from tpu_raiden.frameworks.jax import weight_synchronizer_ffi as raiden_ffi  # pylint: disable=g-import-not-at-top
 
     def _unpack_ip(row: np.ndarray) -> str:
@@ -1352,11 +1370,13 @@ class PeftTrainer(abstract_trainer.AbstractTrainer):
         src_global_ids,
         shd.NamedSharding(mesh, shd.PartitionSpec(*mesh.axis_names)),
     )
+    slice_byte_sizes = jnp.array([max_slice_size] * len(arrays), dtype=jnp.int32)
     src_ws_info = raiden_ffi.init_weight_synchronizer_and_d2h(
-        device_array=arrays[0],
+        device_arrays=list(arrays),
         shard_idx=src_shard_idx,
         mesh=mesh,
-        slice_byte_size=max_slice_size,
+        slice_byte_sizes=slice_byte_sizes,
+        local_port=0,
         parallelism=int(kwargs.get("parallelism", 16)),
         num_layers=len(arrays),
         listener_port=0,
