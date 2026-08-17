@@ -155,4 +155,21 @@ This document tracks all fixes, issues encountered, root causes, and resolutions
   2. **gRPC Keepalive Tuning**: Added `grpc.http2.min_recv_ping_interval_without_data_ms=5000` and `grpc.http2.max_ping_strikes=0` in `tunix/experimental/worker/remote_execution.py` to eliminate `ENHANCE_YOUR_CALM (too_many_pings)` GOAWAY disconnects across Kubernetes pod services.
   3. **Pathways FFI Custom Call Scope**: On SPS / Pathways backend slices, TPU operations run on the remote Pathways server daemon (`server:latest`). When running with Pathways, low-level FFI custom calls require the C++ SO to be linked into the Pathways server image, while the high-level `WeightSynchronizer` and coordinator transport operate seamlessly in direct host-to-host container topologies.
 
+---
+
+## 7. Docker Image (`raiden-0815`) Upgrade & Patch Cleanup
+
+- **Container Image**: `gcr.io/tpu-prod-env-multipod/mohitkhatwani-trellis:raiden-0815`.
+- **Environment**:
+  - `jax`: `0.11.0`
+  - `jaxlib`: `0.11.0`
+  - `flax`: `0.12.8`
+  - `tpu_raiden_jax`: `0.0.1.dev20260811205702`
+- **Actions Taken**:
+  1. **Clean Dependency Management**: Upgraded `pyproject.toml` (`jax[tpu]<=0.11.0`) and `scripts/install_tunix_vllm_requirement.sh` (`flax>=0.12.5`), enabling native JAX 0.11.0 and Flax 0.12.8 compatibility without monkey-patching or compatibility bridges.
+  2. **Removed Custom TPU-Raiden Patch**: Deleted `tunix/third_party/tpu_raiden_patches/weight_synchronizer_ffi.py`.
+  3. **Aligned FFI Parameters**: Updated `peft_trainer_v2.py` and `legacy_vllm_sampler_adapter.py` to use `device_arrays=list(arrays)` and `slice_byte_sizes=slice_byte_sizes`, with a lightweight decorator wrapper for JAX 0.11.0's `compute_on` context manager.
+  4. **K8s Launcher Default**: Updated `TUNIX_IMAGE` in `tunix/experimental/examples/math_gsm8k_dist/k8s_launcher.sh` to default to `gcr.io/tpu-prod-env-multipod/mohitkhatwani-trellis:raiden-0815`.
+  5. **Verification**: Executed all 7 unit/integration tests with 100% pass rate (`7 passed, 1 warning in 65.13s`) and verified end-to-end multi-slice execution on GKE `auto-v5p-8-bodaborg` with vLLM generation running at ~4.0 it/s.
+
 
