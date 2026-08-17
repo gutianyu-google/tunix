@@ -14,7 +14,7 @@
 # limitations under the License.
 
 COMMAND=""
-TUNIX_IMAGE=${TUNIX_IMAGE:-"gcr.io/tpu-prod-env-multipod/mohitkhatwani-trellis:raiden-0814"}
+TUNIX_IMAGE=${TUNIX_IMAGE:-"gcr.io/tpu-prod-env-multipod/mohitkhatwani-trellis:raiden-0815"}
 
 export MODEL_NAME=${MODEL_NAME:-Qwen3-1.7B}
 export MODEL_ID=${MODEL_ID:-Qwen/Qwen3-1.7B}
